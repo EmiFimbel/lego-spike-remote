@@ -1,0 +1,150 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<title>LEGO SPIKE – Diagnostic Bluetooth</title>
+<style>
+*{box-sizing:border-box}
+body{margin:0;min-height:100vh;padding:18px;background:#0e1117;color:white;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Arial,sans-serif}
+main{max-width:520px;margin:auto}
+.card{background:#191f29;border-radius:22px;padding:20px;margin-bottom:14px}
+h1{text-align:center;font-size:25px;margin:0 0 6px}
+p{color:#bdc7d5;line-height:1.4}
+button{width:100%;border:0;border-radius:18px;padding:17px;font-size:18px;font-weight:800;background:#1683ff;color:#fff;margin:8px 0}
+button.secondary{background:#6657d9}
+.status{padding:13px;border-radius:14px;background:#10151c;margin-top:10px;font-weight:700;text-align:center}
+.ok{color:#79e58c}.bad{color:#ff9090}.warn{color:#ffd166}
+pre{white-space:pre-wrap;word-break:break-word;background:#0b0f14;padding:12px;border-radius:12px;color:#c9d3df;font-size:12px;max-height:260px;overflow:auto}
+.small{font-size:12px;color:#8f9bab}
+</style>
+</head>
+<body>
+<main>
+<div class="card">
+<h1>LEGO SPIKE Diagnostic</h1>
+<p style="text-align:center">Test bidirectionnel FD02 — aucun moteur ne sera activé.</p>
+<button id="connect">🔵 CONNECTER LE HUB</button>
+<div id="status" class="status">⚪ Non connecté</div>
+</div>
+
+<div class="card">
+<button id="info" class="secondary" disabled>📡 ENVOYER INFO REQUEST</button>
+<div id="result" class="status">En attente d'une réponse du hub…</div>
+<p class="small">Le test écoute la caractéristique TX du service SPIKE, puis envoie une requête d'information sur RX.</p>
+</div>
+
+<div class="card">
+<strong>Journal technique</strong>
+<pre id="log">Prêt.</pre>
+</div>
+</main>
+
+<script>
+const SERVICE='0000fd02-0000-1000-8000-00805f9b34fb';
+const RX='0000fd02-0001-1000-8000-00805f9b34fb';
+const TX='0000fd02-0002-1000-8000-00805f9b34fb';
+
+let device, rx, tx;
+const status=document.getElementById('status');
+const result=document.getElementById('result');
+const logEl=document.getElementById('log');
+const infoBtn=document.getElementById('info');
+
+function log(s){logEl.textContent += '\n'+s; logEl.scrollTop=logEl.scrollHeight}
+function hex(a){return [...a].map(x=>x.toString(16).padStart(2,'0')).join(' ')}
+function setStatus(t,c=''){status.className='status '+c;status.textContent=t}
+function setResult(t,c=''){result.className='status '+c;result.textContent=t}
+
+// SPIKE protocol framing: COBS/R + XOR 0x03 + 0x02 delimiter.
+// This diagnostic logs the raw TX response as well so we can validate
+// the exact framing used by this firmware before attempting motor control.
+function cobsEncode(data){
+  const MAX=84, OFF=2, NO=255;
+  let out=[], codeIndex=0, block=0;
+  function begin(){codeIndex=out.length;out.push(NO);block=1}
+  begin();
+  for(const byte of data){
+    if(byte>2){out.push(byte);block++}
+    if(byte<=2 || block>MAX){
+      if(byte<=2) out[codeIndex]=byte*MAX+block+OFF;
+      begin();
+    }
+  }
+  out[codeIndex]=block+OFF;
+  return new Uint8Array(out);
+}
+function pack(payload){
+  const enc=cobsEncode(payload);
+  const out=new Uint8Array(enc.length+1);
+  for(let i=0;i<enc.length;i++) out[i]=enc[i]^0x03;
+  out[out.length-1]=0x02;
+  return out;
+}
+
+async function connect(){
+  try{
+    if(!navigator.bluetooth){setStatus('❌ Web Bluetooth indisponible','bad');return}
+    setStatus('🔎 Recherche du hub…');
+    device=await navigator.bluetooth.requestDevice({filters:[{services:[SERVICE]}]});
+    const server=await device.gatt.connect();
+    const service=await server.getPrimaryService(SERVICE);
+    rx=await service.getCharacteristic(RX);
+    tx=await service.getCharacteristic(TX);
+
+    tx.addEventListener('characteristicvaluechanged',ev=>{
+      const raw=new Uint8Array(ev.target.value.buffer,ev.target.value.byteOffset,ev.target.value.byteLength);
+      log('⬅ TX brut ('+raw.length+' octets): '+hex(raw));
+      setResult('✅ Réponse reçue du hub ('+raw.length+' octets)','ok');
+    });
+    await tx.startNotifications();
+
+    setStatus('✅ Hub connecté : '+(device.name||'LEGO Hub'),'ok');
+    log('Connecté à '+(device.name||'LEGO Hub'));
+    log('Notifications TX activées.');
+    infoBtn.disabled=false;
+
+    device.addEventListener('gattserverdisconnected',()=>{
+      setStatus('⚪ Hub déconnecté');
+      infoBtn.disabled=true;
+    });
+  }catch(e){
+    setStatus('❌ '+(e.message||e),'bad');
+    log('Erreur connexion: '+(e.message||e));
+  }
+}
+
+async function sendInfo(){
+  try{
+    result.className='status';
+    result.textContent='⏳ Requête envoyée, attente de réponse…';
+
+    // SPIKE protocol message type 0x00 = InfoRequest.
+    const payload=new Uint8Array([0x00]);
+    const framed=pack(payload);
+    log('➡ InfoRequest payload: '+hex(payload));
+    log('➡ RX encodé: '+hex(framed));
+
+    if(rx.properties.writeWithoutResponse){
+      await rx.writeValueWithoutResponse(framed);
+    }else{
+      await rx.writeValue(framed);
+    }
+
+    setTimeout(()=>{
+      if(result.textContent.startsWith('⏳')){
+        setResult('⚠️ Aucune réponse reçue après 3 secondes','warn');
+        log('Aucune notification TX reçue.');
+      }
+    },3000);
+  }catch(e){
+    setResult('❌ '+(e.message||e),'bad');
+    log('Erreur envoi: '+(e.message||e));
+  }
+}
+
+document.getElementById('connect').addEventListener('click',connect);
+infoBtn.addEventListener('click',sendInfo);
+</script>
+</body>
+</html>
